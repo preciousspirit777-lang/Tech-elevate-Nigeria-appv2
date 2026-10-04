@@ -1,0 +1,301 @@
+-- ====================================================================
+-- TechElevate Nigeria: Multi-Tenant Learning OS
+-- Database Migration & Row-Level Security (RLS) Schema
+-- Optimized for Supabase Auth, Google OAuth & Magic Links
+-- ====================================================================
+
+-- 1. EXTENSIONS
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 2. ENUMS
+DO $$ BEGIN
+    CREATE TYPE user_role AS ENUM ('student', 'teacher', 'school_admin');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE education_tier AS ENUM ('primary', 'secondary', 'tertiary');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE submission_status AS ENUM ('pending', 'passed', 'review_needed', 'failed');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+-- 3. SCHOOL TENANTS TABLE
+CREATE TABLE IF NOT EXISTS public.schools (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    logo_url TEXT,
+    primary_color TEXT DEFAULT '#10b981',
+    state TEXT DEFAULT 'Lagos',
+    tier_plan TEXT DEFAULT 'State EdTech Standard',
+    max_seats INT DEFAULT 500,
+    license_key TEXT UNIQUE NOT NULL,
+    license_expires TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '1 year'),
+    created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 4. PROFILES TABLE (Linked to auth.users with CASCADE)
+CREATE TABLE IF NOT EXISTS public.profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    full_name TEXT NOT NULL DEFAULT 'TechElevate Scholar',
+    avatar_url TEXT,
+    role user_role NOT NULL DEFAULT 'student',
+    school_id UUID REFERENCES public.schools(id) ON DELETE SET NULL,
+    tier education_tier NOT NULL DEFAULT 'secondary',
+    grade_level TEXT DEFAULT 'SS2 - Science & Tech',
+    xp_points INT NOT NULL DEFAULT 150,
+    current_streak INT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Index for fast lookup by school and role
+CREATE INDEX IF NOT EXISTS idx_profiles_school_role ON public.profiles(school_id, role);
+
+-- 5. LESSONS & CURRICULUM TABLE
+CREATE TABLE IF NOT EXISTS public.lessons (
+    id TEXT PRIMARY KEY,
+    tier education_tier NOT NULL,
+    module TEXT NOT NULL,
+    title TEXT NOT NULL,
+    language TEXT NOT NULL,
+    difficulty TEXT NOT NULL,
+    description TEXT NOT NULL,
+    starter_code TEXT NOT NULL,
+    cultural_context TEXT,
+    xp_reward INT DEFAULT 100,
+    created_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 6. STUDENT CODE SUBMISSIONS TABLE
+CREATE TABLE IF NOT EXISTS public.submissions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    lesson_id TEXT NOT NULL REFERENCES public.lessons(id) ON DELETE CASCADE,
+    language TEXT NOT NULL,
+    code TEXT NOT NULL,
+    status submission_status DEFAULT 'pending',
+    score INT DEFAULT 0 CHECK (score >= 0 AND score <= 100),
+    feedback TEXT,
+    graded_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    submitted_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 7. AUTOMATIC USER CREATION TRIGGER (auth.users -> profiles)
+-- Handles Google OAuth and Passwordless Magic Links with metadata extraction
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+DECLARE
+    default_school UUID;
+    extracted_role user_role;
+    extracted_name TEXT;
+    extracted_avatar TEXT;
+    extracted_tier education_tier;
+BEGIN
+    -- Fallback default school ID
+    SELECT id INTO default_school FROM public.schools LIMIT 1;
+    
+    -- Extract Name from OAuth / Magic link raw_user_meta_data
+    extracted_name := COALESCE(
+        new.raw_user_meta_data->>'full_name',
+        new.raw_user_meta_data->>'name',
+        split_part(new.email, '@', 1)
+    );
+
+    extracted_avatar := COALESCE(
+        new.raw_user_meta_data->>'avatar_url',
+        new.raw_user_meta_data->>'picture',
+        'https://api.dicebear.com/7.x/bottts/svg?seed=' || new.id
+    );
+
+    -- Role defaults to 'student' unless passed in metadata
+    extracted_role := CASE
+        WHEN new.raw_user_meta_data->>'role' = 'teacher' THEN 'teacher'::user_role
+        WHEN new.raw_user_meta_data->>'role' = 'school_admin' THEN 'school_admin'::user_role
+        ELSE 'student'::user_role
+    END;
+
+    extracted_tier := CASE
+        WHEN new.raw_user_meta_data->>'tier' = 'primary' THEN 'primary'::education_tier
+        WHEN new.raw_user_meta_data->>'tier' = 'tertiary' THEN 'tertiary'::education_tier
+        ELSE 'secondary'::education_tier
+    END;
+
+    INSERT INTO public.profiles (
+        id,
+        email,
+        full_name,
+        avatar_url,
+        role,
+        school_id,
+        tier,
+        xp_points,
+        current_streak
+    )
+    VALUES (
+        new.id,
+        new.email,
+        extracted_name,
+        extracted_avatar,
+        extracted_role,
+        default_school,
+        extracted_tier,
+        150,
+        1
+    )
+    ON CONFLICT (id) DO UPDATE SET
+        full_name = EXCLUDED.full_name,
+        avatar_url = EXCLUDED.avatar_url,
+        updated_at = NOW();
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Bind Trigger to auth.users table
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- 8. ROW LEVEL SECURITY (RLS) POLICIES
+
+-- Enable RLS on all tables
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.schools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.lessons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.submissions ENABLE ROW LEVEL SECURITY;
+
+-- Profiles:
+-- 1) Any authenticated user can view their own profile
+CREATE POLICY "Users can view own profile"
+    ON public.profiles FOR SELECT
+    TO authenticated
+    USING (auth.uid() = id);
+
+-- 2) School Admins and Teachers can view profiles in their school
+CREATE POLICY "Staff can view students in same school"
+    ON public.profiles FOR SELECT
+    TO authenticated
+    USING (
+        school_id IN (
+            SELECT school_id FROM public.profiles 
+            WHERE id = auth.uid() AND role IN ('school_admin', 'teacher')
+        )
+    );
+
+-- 3) Users can update their own profile info
+CREATE POLICY "Users can update own profile"
+    ON public.profiles FOR UPDATE
+    TO authenticated
+    USING (auth.uid() = id)
+    WITH CHECK (auth.uid() = id);
+
+-- Schools:
+-- Anyone can view basic school info; school_admin can update their school
+CREATE POLICY "Anyone authenticated can view schools"
+    ON public.schools FOR SELECT
+    TO authenticated
+    USING (true);
+
+CREATE POLICY "Admins can update their school"
+    ON public.schools FOR UPDATE
+    TO authenticated
+    USING (
+        id IN (SELECT school_id FROM public.profiles WHERE id = auth.uid() AND role = 'school_admin')
+    );
+
+-- Lessons:
+-- Read-only for all authenticated students/staff
+CREATE POLICY "Lessons readable by all authenticated users"
+    ON public.lessons FOR SELECT
+    TO authenticated
+    USING (true);
+
+-- Submissions:
+-- Students can view and insert their own submissions
+CREATE POLICY "Students can view own submissions"
+    ON public.submissions FOR SELECT
+    TO authenticated
+    USING (student_id = auth.uid());
+
+CREATE POLICY "Students can insert own submissions"
+    ON public.submissions FOR INSERT
+    TO authenticated
+    WITH CHECK (student_id = auth.uid());
+
+-- Teachers & Admins can view and grade submissions in their school
+CREATE POLICY "Teachers can review school submissions"
+    ON public.submissions FOR ALL
+    TO authenticated
+    USING (
+        student_id IN (
+            SELECT p.id FROM public.profiles p
+            WHERE p.school_id IN (
+                SELECT staff.school_id FROM public.profiles staff 
+                WHERE staff.id = auth.uid() AND staff.role IN ('teacher', 'school_admin')
+            )
+        )
+    );
+
+-- 9. SECURITY DEFINER HELPER: update_student_role
+-- Allows verified school admins to promote/demote or update student roles securely
+CREATE OR REPLACE FUNCTION public.update_student_role(
+    target_student_id UUID,
+    new_role user_role
+)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    caller_role user_role;
+    caller_school UUID;
+    target_school UUID;
+BEGIN
+    -- Verify caller
+    SELECT role, school_id INTO caller_role, caller_school
+    FROM public.profiles
+    WHERE id = auth.uid();
+
+    IF caller_role != 'school_admin' THEN
+        RAISE EXCEPTION 'Unauthorized: Only school admins may reassign student roles.';
+    END IF;
+
+    -- Verify target is within the same school
+    SELECT school_id INTO target_school
+    FROM public.profiles
+    WHERE id = target_student_id;
+
+    IF caller_school != target_school THEN
+        RAISE EXCEPTION 'Cross-tenant violation: Student belongs to another school.';
+    END IF;
+
+    -- Perform update
+    UPDATE public.profiles
+    SET role = new_role, updated_at = NOW()
+    WHERE id = target_student_id;
+
+    RETURN json_build_object(
+        'success', true,
+        'student_id', target_student_id,
+        'new_role', new_role
+    );
+END;
+$$;
+
+-- 10. INITIAL SEED DATA FOR DEMO & SCHOOL SETUP
+INSERT INTO public.schools (id, name, slug, primary_color, state, tier_plan, max_seats, license_key)
+VALUES 
+    ('11111111-1111-1111-1111-111111111111', 'King''s College Lagos (STEM Wing)', 'kings-college-lagos', '#10b981', 'Lagos', 'State EdTech Standard', 500, 'NGA-KCL-STEM-2026'),
+    ('22222222-2222-2222-2222-222222222222', 'Queen''s College Yaba (Girls in Tech)', 'queens-college-yaba', '#8b5cf6', 'Lagos', 'Federal Innovation Enterprise', 750, 'NGA-QCY-GIT-2026'),
+    ('33333333-3333-3333-3333-333333333333', 'Government College Kaduna', 'gov-college-kaduna', '#0ea5e9', 'Kaduna', 'Basic STEM Grant', 300, 'NGA-GCK-STEM-2026')
+ON CONFLICT (id) DO NOTHING;
